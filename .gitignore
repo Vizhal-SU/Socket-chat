@@ -1,0 +1,8 @@
+client
+server
+*.o
+*.so
+*.a
+*.out
+*.exe
+.vscode
