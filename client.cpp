@@ -1,81 +1,115 @@
-// client.cpp
-// Multi-client chat client
-// Features:
-//  - Ask user for name, send it immediately (handshake)
-//  - Reader thread listens for messages
-//  - Replace own [name] with "You:"
-//  - Messages appear color-coded as sent by server
-
+#include "utils.hpp"
+#include <atomic>
 #include <iostream>
 #include <string>
-#include <thread>
-#include <atomic>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
-// Background thread: listens for messages from server
-void socket_reader(int sockfd, const std::string& myname, std::atomic<bool>& running) {
-    char buf[512];
-    while (running) {
-        ssize_t n = ::recv(sockfd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) {
-            std::cout << "\n[disconnected]\n";
-            running = false;
-            break;
-        }
-        buf[n] = '\0';
-        std::string msg(buf);
+#include <readline/history.h>
+#include <readline/readline.h>
+#include <sys/select.h>
+#include <unistd.h> // For STDIN_FILENO
 
-        // If server sent our own name, replace with "You:"
-        std::string tag = "[" + myname + "]";
-        if (msg.find(tag) == 0) {
-            msg.replace(0, tag.size(), "You:");
-        }
+// Global state for the callback and main loop
+static std::atomic<bool> running(true);
+static int global_sockfd = -1;
 
-        std::cout << "\r" << msg << "\n\t>> " << std::flush;
+// This function is called by Readline when the user presses Enter
+void line_handler(char* line_c) {
+    if (line_c == nullptr) { // User pressed Ctrl+D
+        running = false;
+        return;
     }
+    
+    if (line_c[0] != '\0') {
+        add_history(line_c);
+        if (!send_all(global_sockfd, std::string(line_c))) {
+            running = false;
+        }
+    }
+    
+    free(line_c);
 }
 
 int main() {
-    int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("socket");
-        return 1;
-    }
+    Socket sock = connect_to_server("127.0.0.1", PORT);
+    if (!sock) return 1;
+    global_sockfd = sock.get();
 
-    sockaddr_in server{};
-    server.sin_family = AF_INET;
-    server.sin_port = htons(8080);
-    inet_pton(AF_INET, "127.0.0.1", &server.sin_addr);
-
-    if (::connect(sockfd, (sockaddr*)&server, sizeof(server)) < 0) {
-        perror("connect");
-        return 1;
-    }
-
-    std::cout << "Enter your name: ";
     std::string name;
+    std::cout << "Enter your name: ";
     std::getline(std::cin, name);
-
-    // Send name as handshake
-    std::string hello = name + "\n";
-    ::send(sockfd, hello.c_str(), hello.size(), 0);
-
-    std::atomic<bool> running(true);
-    std::thread reader(socket_reader, sockfd, name, std::ref(running));
-
-    // Main loop: read stdin and send to server
-    std::string line;
-    while (running && std::getline(std::cin, line)) {
-        line += "\n";
-        ::send(sockfd, line.c_str(), line.size(), 0);
-        std::cout << "\t>> " << std::flush;
+    if (!send_all(global_sockfd, name + "\n")) {
+        std::cerr << "Failed to send handshake.\n";
+        return 1;
     }
 
-    running = false;
-    ::close(sockfd);
-    reader.join();
+    rl_callback_handler_install(">> ", line_handler);
 
+    while (running) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        FD_SET(global_sockfd, &readfds);
+
+        if (select(global_sockfd + 1, &readfds, nullptr, nullptr, nullptr) < 0) {
+            perror("select");
+            break;
+        }
+
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            rl_callback_read_char();
+        }
+
+        if (FD_ISSET(global_sockfd, &readfds)) {
+            char buf[MAXDATASIZE];
+            ssize_t n = ::recv(global_sockfd, buf, sizeof(buf) - 1, 0);
+
+            if (n <= 0) {
+                if (running) {
+                    // Save user's line, print disconnect, then restore
+                    char *saved_line = rl_copy_text(0, rl_end);
+                    int saved_point = rl_point;
+                    std::cout << "\r\x1b[K[disconnected]\n" << std::flush;
+                    rl_replace_line(saved_line, 0);
+                    rl_point = saved_point;
+                    rl_forced_update_display();
+                    free(saved_line);
+                }
+                running = false;
+                break;
+            }
+            buf[n] = '\0';
+            std::string msg(buf);
+            if (!msg.empty() && msg.back() == '\n') msg.pop_back();
+
+            // --- UNIFIED MESSAGE HANDLING LOGIC ---
+            
+            // 1. Save what the user is currently typing
+            char *saved_line = rl_copy_text(0, rl_end);
+            int saved_point = rl_point;
+
+            // 2. Clear the prompt line and print the new message
+            std::cout << "\r\x1b[K";
+            
+            // Check if it's our own message and format it
+            const std::string my_tag = "[" + name + "]";
+            if (msg.find(my_tag, 0) != std::string::npos) {
+                msg.replace(msg.find(my_tag, 0), my_tag.length(), "\t\tYou: ");
+                std::cout << "\x1b[A\x1b[2K";
+            }
+            std::cout << msg << std::endl;
+
+            // 3. Restore the user's saved text into Readline's buffer
+            rl_replace_line(saved_line, 0);
+            rl_point = saved_point;
+
+            // 4. Tell Readline to redraw the prompt and the restored text
+            rl_forced_update_display();
+
+            free(saved_line);
+        }
+    }
+    
+    rl_callback_handler_remove();
+    std::cout << "\nGoodbye!\n";
     return 0;
 }

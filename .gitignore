@@ -6,3 +6,5 @@ server
 *.out
 *.exe
 .vscode
+scrap.cpp
+build
