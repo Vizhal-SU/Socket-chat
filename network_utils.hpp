@@ -5,12 +5,12 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
 #include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <fcntl.h>
 
 // --- Constants ---
 inline constexpr const char* PORT = "8080";
@@ -43,7 +43,6 @@ struct Socket {
     explicit operator bool() const { return fd != -1; }
 };
 
-// --- Helper Functions ---
 
 // Get sockaddr, IPv4 or IPv6:
 inline void* get_in_addr(sockaddr* sa) {
@@ -147,4 +146,13 @@ inline Socket connect_to_server(const char* host, const char* port) {
     freeaddrinfo(servinfo);
 
     return Socket{sockfd};
+}
+
+// Sets a socket to non-blocking mode.
+inline bool set_non_blocking(int fd) {
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        return false;
+    }
+    return true;
 }

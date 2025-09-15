@@ -1,115 +1,136 @@
-#include "utils.hpp"
-#include <atomic>
+#include "client.hpp"
 #include <iostream>
-#include <string>
-
+#include <stdexcept>
 #include <readline/history.h>
 #include <readline/readline.h>
 #include <sys/select.h>
-#include <unistd.h> // For STDIN_FILENO
+#include <unistd.h>
 
-// Global state for the callback and main loop
-static std::atomic<bool> running(true);
-static int global_sockfd = -1;
+// Initialize static pointer
+ChatClient* ChatClient::current_instance_ = nullptr;
 
-// This function is called by Readline when the user presses Enter
-void line_handler(char* line_c) {
-    if (line_c == nullptr) { // User pressed Ctrl+D
-        running = false;
-        return;
+ChatClient::ChatClient(const std::string& host, const std::string& port) 
+    : sock_(connect_to_server(host.c_str(), port.c_str())) {
+    if (!sock_) {
+        throw std::runtime_error("Failed to connect to server");
     }
-    
-    if (line_c[0] != '\0') {
-        add_history(line_c);
-        if (!send_all(global_sockfd, std::string(line_c))) {
-            running = false;
-        }
-    }
-    
-    free(line_c);
+    current_instance_ = this;
 }
 
-int main() {
-    Socket sock = connect_to_server("127.0.0.1", PORT);
-    if (!sock) return 1;
-    global_sockfd = sock.get();
-
-    std::string name;
+void ChatClient::run() {
     std::cout << "Enter your name: ";
-    std::getline(std::cin, name);
-    if (!send_all(global_sockfd, name + "\n")) {
+    std::getline(std::cin, name_);
+    if (!send_all(sock_.get(), name_ + "\n")) {
         std::cerr << "Failed to send handshake.\n";
-        return 1;
+        return;
     }
 
-    rl_callback_handler_install(">> ", line_handler);
+    setup_readline();
+    event_loop();
+    cleanup_readline();
 
-    while (running) {
+    std::cout << "\nGoodbye!\n";
+}
+
+void ChatClient::setup_readline() {
+    rl_callback_handler_install(">> ", ChatClient::line_handler);
+}
+
+void ChatClient::cleanup_readline() {
+    rl_callback_handler_remove();
+}
+
+void ChatClient::event_loop() {
+    while (running_) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(STDIN_FILENO, &readfds);
-        FD_SET(global_sockfd, &readfds);
+        FD_SET(sock_.get(), &readfds);
 
-        if (select(global_sockfd + 1, &readfds, nullptr, nullptr, nullptr) < 0) {
+        if (select(sock_.get() + 1, &readfds, nullptr, nullptr, nullptr) < 0) {
             perror("select");
             break;
         }
 
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            rl_callback_read_char();
+            handle_user_input();
         }
 
-        if (FD_ISSET(global_sockfd, &readfds)) {
-            char buf[MAXDATASIZE];
-            ssize_t n = ::recv(global_sockfd, buf, sizeof(buf) - 1, 0);
+        if (FD_ISSET(sock_.get(), &readfds)) {
+            handle_network_message();
+        }
+    }
+}
 
-            if (n <= 0) {
-                if (running) {
-                    // Save user's line, print disconnect, then restore
-                    char *saved_line = rl_copy_text(0, rl_end);
-                    int saved_point = rl_point;
-                    std::cout << "\r\x1b[K[disconnected]\n" << std::flush;
-                    rl_replace_line(saved_line, 0);
-                    rl_point = saved_point;
-                    rl_forced_update_display();
-                    free(saved_line);
-                }
-                running = false;
-                break;
-            }
-            buf[n] = '\0';
-            std::string msg(buf);
-            if (!msg.empty() && msg.back() == '\n') msg.pop_back();
+void ChatClient::handle_user_input() {
+    rl_callback_read_char();
+}
 
-            // --- UNIFIED MESSAGE HANDLING LOGIC ---
-            
-            // 1. Save what the user is currently typing
-            char *saved_line = rl_copy_text(0, rl_end);
-            int saved_point = rl_point;
+void ChatClient::handle_network_message() {
+    char buf[MAXDATASIZE];
+    ssize_t n = ::recv(sock_.get(), buf, sizeof(buf) - 1, 0);
 
-            // 2. Clear the prompt line and print the new message
-            std::cout << "\r\x1b[K";
-            
-            // Check if it's our own message and format it
-            const std::string my_tag = "[" + name + "]";
-            if (msg.find(my_tag, 0) != std::string::npos) {
-                msg.replace(msg.find(my_tag, 0), my_tag.length(), "\t\tYou: ");
-                std::cout << "\x1b[A\x1b[2K";
-            }
-            std::cout << msg << std::endl;
+    if (n <= 0) { // Handle disconnect
+        if (running_) {
+            std::cout << "\r\x1b[K[disconnected]\n" << std::flush;
+            rl_redisplay(); // Just redisplay here, no need for full save/restore
+        }
+        running_ = false;
+        return;
+    }
+    buf[n] = '\0';
+    std::string msg(buf);
+    
+    // 1. Save what the user is currently typing
+    char *saved_line = rl_copy_text(0, rl_end);
+    int saved_point = rl_point;
 
-            // 3. Restore the user's saved text into Readline's buffer
-            rl_replace_line(saved_line, 0);
-            rl_point = saved_point;
+    // 2. Clear the prompt line visually
+    std::cout << "\r\x1b[K";
+    
+    // 3. Format the message (handle "You:" case)
+    const std::string my_tag = "[" + name_ + "]";
+    if (msg.find(my_tag) != std::string::npos) {
+        msg.replace(msg.find(my_tag), my_tag.length(), "You:");
+        std::cout << "\x1b[A\x1b[2K";
+    }
+    
+    // 4. Print the final, formatted message and a newline
+    std::cout << msg << std::flush;
 
-            // 4. Tell Readline to redraw the prompt and the restored text
-            rl_forced_update_display();
+    // 5. Restore the user's saved text into Readline's buffer
+    rl_replace_line(saved_line, 0);
+    rl_point = saved_point;
 
-            free(saved_line);
+    // 6. Tell Readline to redraw the prompt and the restored text
+    rl_forced_update_display();
+
+    free(saved_line);
+}
+
+void ChatClient::line_handler(char* line) {     // static (c-style) fn as required by readline
+    if (line == nullptr) { // Ctrl+D
+        current_instance_->running_ = false;
+        return;
+    }
+    
+    if (line[0] != '\0') {
+        add_history(line);
+        if (!send_all(current_instance_->sock_.get(), std::string(line) + "\n")) {
+            current_instance_->running_ = false;
         }
     }
     
-    rl_callback_handler_remove();
-    std::cout << "\nGoodbye!\n";
+    free(line);
+}
+
+int main() {
+    try {
+        ChatClient client("127.0.0.1", PORT);
+        client.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     return 0;
 }
