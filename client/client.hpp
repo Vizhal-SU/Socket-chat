@@ -1,22 +1,24 @@
 #pragma once
-
 #include "network_utils.hpp"
 #include <string>
 #include <atomic>
 
 class ChatClient {
 public:
-    ChatClient(const std::string& host, const std::string& port);
+    static ChatClient& instance(const std::string& host, const std::string& port);
+
+    ChatClient(const ChatClient&) = delete;
+    ChatClient& operator=(const ChatClient&) = delete;
+
     void run();
 
 private:
+    ChatClient(const std::string& host, const std::string& port);
+    
     // --- Member Variables (State) ---
     Socket sock_;
     std::string name_;
     std::atomic<bool> running_{true};
-
-    // Static pointer to the current instance, used as a bridge for the C-style callback.
-    static ChatClient* current_instance_;
 
     // --- Private Helper Functions ---
     void setup_readline();

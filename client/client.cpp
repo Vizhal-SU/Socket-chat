@@ -6,15 +6,16 @@
 #include <sys/select.h>
 #include <unistd.h>
 
-// Initialize static pointer
-ChatClient* ChatClient::current_instance_ = nullptr;
-
 ChatClient::ChatClient(const std::string& host, const std::string& port) 
     : sock_(connect_to_server(host.c_str(), port.c_str())) {
     if (!sock_) {
         throw std::runtime_error("Failed to connect to server");
     }
-    current_instance_ = this;
+}
+
+ChatClient& ChatClient::instance(const std::string& host, const std::string& port) {
+    static ChatClient single_instance(host, port);
+    return single_instance;
 }
 
 void ChatClient::run() {
@@ -109,15 +110,16 @@ void ChatClient::handle_network_message() {
 }
 
 void ChatClient::line_handler(char* line) {     // static (c-style) fn as required by readline
+    auto& client = ChatClient::instance("", ""); // Get the singleton instance
     if (line == nullptr) { // Ctrl+D
-        current_instance_->running_ = false;
+        client.running_ = false;
         return;
     }
     
     if (line[0] != '\0') {
         add_history(line);
-        if (!send_all(current_instance_->sock_.get(), std::string(line) + "\n")) {
-            current_instance_->running_ = false;
+        if (!send_all(client.sock_.get(), std::string(line) + "\n")) {
+            client.running_ = false;
         }
     }
     
@@ -126,8 +128,7 @@ void ChatClient::line_handler(char* line) {     // static (c-style) fn as requir
 
 int main() {
     try {
-        ChatClient client("127.0.0.1", PORT);
-        client.run();
+        ChatClient::instance("127.0.0.1", PORT).run();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
